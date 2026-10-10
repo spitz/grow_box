@@ -28,6 +28,16 @@
  *   fans hold a minimum speed at 0 % duty by design. Run SWEEP to find out
  *   what yours actually does.
  *
+ * FAN SCHEDULE
+ *   The fan runs in bursts: FANRUN seconds out of every FANEVERY minutes,
+ *   locked to the cycle clock, so with the defaults it runs 00:00:00-00:00:30,
+ *   00:30:00-00:30:30 and so on (and FAST speeds it up with everything else).
+ *   If FANEVERY does not divide 24 h evenly, the last burst of the day is
+ *   cut short when the cycle wraps.
+ *   Between bursts the duty drops to 0 — which, per the note above, may
+ *   only slow a 4-pin fan rather than stop it. If yours keeps spinning,
+ *   the only cure is switching its 12 V supply.
+ *
  * HEARTBEAT
  *   The onboard LED on D13 breathes continuously so you can see at a glance
  *   that the sketch is alive. D13 has no hardware PWM on the Uno, so this is
@@ -48,8 +58,20 @@
 #define PIN_FAN_TACH 2            // INT0
 #define PIN_HEARTBEAT 13          // onboard LED, no hardware PWM here
 
+// Out-of-the-box settings, also what DEFAULTS reloads. All of these can be
+// changed live over serial and kept with SAVE; edit them here to change
+// what a freshly flashed board does.
+const uint16_t DEFAULT_LIGHT_ON_MIN    = 12 * 60;  // 12 h on, 12 h dark
+const uint16_t DEFAULT_LIGHT_START_MIN = 0;        // light comes up at 00:00
+const uint8_t  DEFAULT_LIGHT_LEVEL     = 255;      // full brightness
+const uint16_t DEFAULT_RAMP_SEC        = 300;      // 5 min sunrise / sunset
+const uint8_t  DEFAULT_FAN_DUTY        = 100;      // ~40 %, quiet but moving air
+const uint16_t DEFAULT_FAN_EVERY_MIN   = 30;       // start a fan burst this often (once every 30 minutes)
+const uint16_t DEFAULT_FAN_RUN_SEC     = 30;       // and run it this long (30 seconds)
+const uint16_t DEFAULT_LOG_SEC         = 60;
+
 const uint32_t DAY_MS    = 86400000UL;
-const uint16_t CFG_MAGIC = 0xB452;      // bumped: struct changed since step 1
+const uint16_t CFG_MAGIC = 0xB453;      // bumped: struct changed (fan schedule)
 const int      EE_ADDR   = 0;
 
 struct Config {
@@ -58,7 +80,9 @@ struct Config {
   uint16_t startMin;         // minute of the cycle when the light comes up
   uint8_t  level;            // 0-255 light duty at full brightness
   uint16_t rampSec;          // sunrise / sunset fade length
-  uint8_t  fanDuty;          // 0-255 fan duty
+  uint8_t  fanDuty;          // 0-255 fan duty while a burst is running
+  uint16_t fanEveryMin;      // fan burst period, 1-1440 min
+  uint16_t fanRunSec;        // fan burst length; >= period means always on
   uint16_t logSec;           // status line interval
   uint16_t sum;
 };
@@ -67,12 +91,14 @@ Config cfg;
 
 void cfgDefaults() {
   cfg.magic          = CFG_MAGIC;
-  cfg.photoperiodMin = 18 * 60;   // 18 h on, 6 h dark
-  cfg.startMin       = 0;
-  cfg.level          = 255;
-  cfg.rampSec        = 300;
-  cfg.fanDuty        = 100;       // ~40 %, quiet but moving air
-  cfg.logSec         = 60;
+  cfg.photoperiodMin = DEFAULT_LIGHT_ON_MIN;
+  cfg.startMin       = DEFAULT_LIGHT_START_MIN;
+  cfg.level          = DEFAULT_LIGHT_LEVEL;
+  cfg.rampSec        = DEFAULT_RAMP_SEC;
+  cfg.fanDuty        = DEFAULT_FAN_DUTY;
+  cfg.fanEveryMin    = DEFAULT_FAN_EVERY_MIN;
+  cfg.fanRunSec      = DEFAULT_FAN_RUN_SEC;
+  cfg.logSec         = DEFAULT_LOG_SEC;
   cfg.sum            = 0;
 }
 
@@ -117,8 +143,11 @@ void fanInit() {
   OCR1A  = 0;
 }
 
-void fanApply() {
-  OCR1A = ((uint32_t)FAN_TOP * cfg.fanDuty) / 255;
+uint8_t fanDutyNow = 0;       // what is actually on the pin right now
+
+void fanWrite(uint8_t duty) {
+  fanDutyNow = duty;
+  OCR1A = ((uint32_t)FAN_TOP * duty) / 255;
 }
 
 // RPM is measured against real time, never the FAST-scaled schedule clock.
@@ -268,6 +297,29 @@ void updateLight() {
   analogWrite(PIN_LED, currentDuty);
 }
 
+// ---------------------------------------------------------- fan schedule
+
+bool fanScheduleSaysOn() {
+  uint32_t periodMs = (uint32_t)cfg.fanEveryMin * 60000UL;
+  uint32_t runMs    = (uint32_t)cfg.fanRunSec * 1000UL;
+  if (runMs == 0)        return false;
+  if (runMs >= periodMs) return true;
+  return (cycleMs % periodMs) < runMs;
+}
+
+bool fanIsOn = false;
+
+void updateFan() {
+  bool on = fanScheduleSaysOn();
+  if (on != fanIsOn) {
+    fanIsOn = on;
+    Serial.print(F("EVT,"));
+    Serial.print(uptimeSec);
+    Serial.println(on ? F(",fan_on") : F(",fan_off"));
+  }
+  fanWrite(on ? cfg.fanDuty : 0);
+}
+
 // -------------------------------------------------------------------- output
 
 void printClock(uint32_t sec) {
@@ -298,7 +350,7 @@ void printLog() {
   Serial.print(currentDuty);                 Serial.print(',');
   printClock(stateElapsed / 1000UL);         Serial.print(',');
   printClock(msLeft / 1000UL);               Serial.print(',');
-  Serial.print(cfg.fanDuty);                 Serial.print(',');
+  Serial.print(fanDutyNow);                  Serial.print(',');
   Serial.print(fanRPM);                      Serial.print(',');
   Serial.println(modeName());
 }
@@ -320,9 +372,13 @@ void printStatus() {
   Serial.print(F("light duty      ")); Serial.print(currentDuty);
   Serial.print(F(" / ")); Serial.println(cfg.level);
   Serial.print(F("ramp            ")); Serial.print(cfg.rampSec); Serial.println(F(" s"));
-  Serial.print(F("fan duty        ")); Serial.print(cfg.fanDuty);
-  Serial.print(F(" / 255  ("));
-  Serial.print((cfg.fanDuty * 100) / 255); Serial.println(F(" %)"));
+  Serial.print(F("fan schedule    ")); Serial.print(cfg.fanRunSec);
+  Serial.print(F(" s every ")); Serial.print(cfg.fanEveryMin); Serial.println(F(" min"));
+  Serial.print(F("fan is          ")); Serial.println(fanIsOn ? F("RUNNING") : F("RESTING"));
+  Serial.print(F("fan duty        ")); Serial.print(fanDutyNow);
+  Serial.print(F(" / ")); Serial.print(cfg.fanDuty);
+  Serial.print(F("  (")); Serial.print((cfg.fanDuty * 100) / 255);
+  Serial.println(F(" % when running)"));
   Serial.print(F("fan speed       ")); Serial.print(fanRPM); Serial.println(F(" rpm"));
   Serial.print(F("clock speed     ")); Serial.print(timeScale); Serial.println(F("x"));
   Serial.println(F("--------------"));
@@ -339,7 +395,9 @@ void printHelp() {
   Serial.println(F("  NOW <hh:mm>       set the current cycle position"));
   Serial.println(F("  LEVEL <0-255>     light brightness at full output"));
   Serial.println(F("  RAMP <sec>        sunrise and sunset fade length"));
-  Serial.println(F("  FAN <0-255>       fan speed"));
+  Serial.println(F("  FAN <0-255>       fan speed while running"));
+  Serial.println(F("  FANEVERY <min>    start a fan burst every this many minutes"));
+  Serial.println(F("  FANRUN <sec>      length of each fan burst (0 = never)"));
   Serial.println(F("  SWEEP             step the fan through its range, report rpm"));
   Serial.println(F("  HB <0|1>          onboard heartbeat LED off / on"));
   Serial.println(F("  LOG <sec>         status line interval"));
@@ -352,23 +410,20 @@ void printHelp() {
 // your particular fan stalls and where it stops speeding up. Blocks for about
 // half a minute.
 void fanSweep() {
-  uint8_t saved = cfg.fanDuty;
   Serial.println(F("duty,percent,rpm"));
   for (uint16_t d = 0; d <= 256; d += 32) {
-    cfg.fanDuty = (uint8_t)(d > 255 ? 255 : d);
-    fanApply();
+    fanWrite((uint8_t)(d > 255 ? 255 : d));
     waitMs(3000);                      // let the fan settle at the new duty
     noInterrupts(); tachPulses = 0; interrupts();
     tachWindowMs = millis();
     waitMs(2000);
     fanSampleRPM();
-    Serial.print(cfg.fanDuty); Serial.print(',');
-    Serial.print((cfg.fanDuty * 100) / 255); Serial.print(',');
+    Serial.print(fanDutyNow); Serial.print(',');
+    Serial.print((fanDutyNow * 100) / 255); Serial.print(',');
     Serial.println(fanRPM);
   }
-  cfg.fanDuty = saved;
-  fanApply();
-  Serial.println(F("OK sweep done, duty restored"));
+  updateFan();
+  Serial.println(F("OK sweep done, fan back on schedule"));
   lastTickMs = millis();               // we blocked; do not credit that as cycle time
 }
 
@@ -401,12 +456,12 @@ void handle(char *line) {
   else if (!strcmp(cmd, "OFF"))  { mode = MODE_OFF;  Serial.println(F("OK forced off")); }
   else if (!strcmp(cmd, "AUTO")) { mode = MODE_AUTO; Serial.println(F("OK back on schedule")); }
   else if (!strcmp(cmd, "HOURS")) {
-    long h = arg ? atol(arg) : 20;
+    long h = arg ? atol(arg) : DEFAULT_LIGHT_ON_MIN / 60;
     cfg.photoperiodMin = (uint16_t)constrain(h * 60L, 0L, 1440L);
     ack(F("photoperiod (min)"), cfg.photoperiodMin);
   }
   else if (!strcmp(cmd, "MINUTES")) {
-    cfg.photoperiodMin = (uint16_t)constrain(arg ? atol(arg) : 1200L, 0L, 1440L);
+    cfg.photoperiodMin = (uint16_t)constrain(arg ? atol(arg) : (long)DEFAULT_LIGHT_ON_MIN, 0L, 1440L);
     ack(F("photoperiod (min)"), cfg.photoperiodMin);
   }
   else if (!strcmp(cmd, "START")) {
@@ -428,9 +483,16 @@ void handle(char *line) {
     ack(F("ramp (s)"), cfg.rampSec);
   }
   else if (!strcmp(cmd, "FAN")) {
-    cfg.fanDuty = (uint8_t)constrain(arg ? atol(arg) : 100L, 0L, 255L);
-    fanApply();
+    cfg.fanDuty = (uint8_t)constrain(arg ? atol(arg) : (long)DEFAULT_FAN_DUTY, 0L, 255L);
     ack(F("fan duty"), cfg.fanDuty);
+  }
+  else if (!strcmp(cmd, "FANEVERY")) {
+    cfg.fanEveryMin = (uint16_t)constrain(arg ? atol(arg) : (long)DEFAULT_FAN_EVERY_MIN, 1L, 1440L);
+    ack(F("fan every (min)"), cfg.fanEveryMin);
+  }
+  else if (!strcmp(cmd, "FANRUN")) {
+    cfg.fanRunSec = (uint16_t)constrain(arg ? atol(arg) : (long)DEFAULT_FAN_RUN_SEC, 0L, 65535L);
+    ack(F("fan run (s)"), cfg.fanRunSec);
   }
   else if (!strcmp(cmd, "SWEEP")) fanSweep();
   else if (!strcmp(cmd, "HB")) {
@@ -449,7 +511,6 @@ void handle(char *line) {
   else if (!strcmp(cmd, "SAVE")) { cfgSave(); Serial.println(F("OK saved")); }
   else if (!strcmp(cmd, "DEFAULTS")) {
     cfgDefaults();
-    fanApply();
     Serial.println(F("OK basil defaults loaded, SAVE to keep them"));
   }
   else { Serial.print(F("ERR unknown: ")); Serial.println(cmd); }
@@ -489,7 +550,6 @@ void setup() {
   }
 
   fanInit();
-  fanApply();
   attachInterrupt(digitalPinToInterrupt(PIN_FAN_TACH), tachISR, FALLING);
 
   lastTickMs   = millis();
@@ -508,6 +568,7 @@ void loop() {
   tick();
   pollSerial();
   updateLight();
+  updateFan();
   fanSampleRPM();
 
   uint32_t now = millis();
